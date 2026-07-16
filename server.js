@@ -371,9 +371,17 @@ app.get('/leads', async (req, res) => {
       ${thumbs ? `<div class="photos">${thumbs}</div>` : ''}
       <footer>
         <span class="status">${esc(l.status)}</span>
-        <form method="POST" action="/leads/${l.id}/status?key=${key}">
-          <button type="submit">Mark ${esc(next)}</button>
-        </form>
+        <div class="actions">
+          <form method="POST" action="/leads/${l.id}/status?key=${key}">
+            <button type="submit">Mark ${esc(next)}</button>
+          </form>
+          <form method="POST" action="/leads/${l.id}/delete?key=${key}"
+                onsubmit="return confirm('Delete this request? This cannot be undone.')">
+            <button type="submit" class="trash" title="Delete request" aria-label="Delete request">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 4h4m-8 3 1 13h10l1-13M10 11v6m4-6v6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </form>
+        </div>
       </footer>
     </article>`;
   }).join('\n');
@@ -409,7 +417,11 @@ app.get('/leads', async (req, res) => {
   .photos img { width: 92px; height: 92px; object-fit: cover; border-radius: 8px; border: 1px solid #DCE4EE; }
   .lead footer { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; }
   .status { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: #5A6A85; }
+  .lead footer .actions { display: flex; gap: 8px; align-items: center; }
   .lead footer button { background: var(--navy); color: #fff; border: 0; padding: 7px 12px; border-radius: 7px; font-size: 13px; cursor: pointer; }
+  .lead footer button.trash { background: #fff; border: 1px solid #DCE4EE; color: #5A6A85; width: 34px; height: 34px; padding: 0; display: grid; place-items: center; }
+  .lead footer button.trash:hover { background: var(--red); border-color: var(--red); color: #fff; }
+  .lead footer button.trash svg { width: 16px; height: 16px; }
 </style></head>
 <body>
 <div class="top"><h1>Patriot's Plumbing — Service Requests</h1><a href="/leads.csv?key=${key}">Download CSV</a></div>
@@ -424,6 +436,12 @@ app.post('/leads/:id/status', async (req, res) => {
     const next = STATUSES[(STATUSES.indexOf(rows[0].status) + 1) % STATUSES.length];
     await pool.query('UPDATE leads SET status = $1 WHERE id = $2', [next, req.params.id]);
   }
+  res.redirect(303, `/leads?key=${encodeURIComponent(req.query.key)}`);
+});
+
+app.post('/leads/:id/delete', async (req, res) => {
+  if (!keyOk(req.query.key)) return res.status(401).send('Unauthorized');
+  await pool.query('DELETE FROM leads WHERE id = $1', [req.params.id]); // photos cascade
   res.redirect(303, `/leads?key=${encodeURIComponent(req.query.key)}`);
 });
 
