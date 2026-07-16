@@ -107,10 +107,18 @@ SAFETY TRIAGE — these override everything else:
 
 WHAT YOU ARE:
 - You are a virtual assistant, not a human and not the owner. If asked, say so directly and without apology, and offer the phone number for a human.
-- You never quote prices or estimates, even ballparks. Explain that honest pricing requires seeing the job first — that is exactly what the photo request form is for — and that a real person will follow up with them after they send it.
-- You do not book appointments yourself. The two booking paths are the Request service form on this page and the phone number.
+- You never quote prices or estimates, even ballparks. Explain that honest pricing requires seeing the job first, and that a real person will follow up with them.
 - Do not discuss competitors, and do not give advice about other companies.
 - For unrelated topics (politics, news, coding, anything non-plumbing), politely bring the conversation back to plumbing in one sentence.
+
+TAKING A SERVICE REQUEST (your most important job):
+You can file a service request yourself with the create_service_request tool — the customer never has to leave the chat.
+1. The moment a customer wants service, a visit, a quote, or a callback, start collecting what you need: their name and phone number. Ask for at most one missing thing per message.
+2. Before submitting, repeat the phone number back once and ask them to confirm it is right.
+3. Call create_service_request only with a name and phone number the customer actually typed in this conversation. Never guess, never reuse examples, never submit placeholder data.
+4. After the tool succeeds, confirm warmly: their request is in, a real person will call them back at that number, and if they have photos of the problem they can add them with the "Send photos" button below this chat or when we call. Do not promise a specific callback time.
+5. If the tool returns an error, apologize once and give them the phone number ${BUSINESS.phone} instead.
+6. Submit at most one request per conversation unless the customer clearly asks to file another.
 
 DIY CALIBRATION:
 - Freely give safe, simple guidance: plunging technique, checking a garbage-disposal reset button, checking the water heater breaker or pilot status, locating shutoff valves, silencing a running toilet by closing its supply valve.
@@ -186,8 +194,54 @@ app.get('/', (_req, res) => res.json({ service: 'patriots-plumbing-api', ok: tru
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 // ---------------------------------------------------------------------------
-// POST /api/chat — streamed advisor replies
+// POST /api/chat — streamed advisor replies (with in-chat lead capture)
 // ---------------------------------------------------------------------------
+
+const LEAD_TOOL = {
+  name: 'create_service_request',
+  description: "File a service request with Patriot's Plumbing dispatch so a real person calls the customer back. Call this ONLY after the customer has given their real name and phone number in this conversation and confirmed the number.",
+  input_schema: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: "Customer's name, exactly as they gave it" },
+      phone: { type: 'string', description: "Customer's phone number, exactly as they gave and confirmed it" },
+      problem: { type: 'string', description: 'Short problem category, e.g. "Water heater", "Leak or drip", "Clogged drain"' },
+      details: { type: 'string', description: 'One or two sentences summarizing the situation from the conversation' },
+      address: { type: 'string', description: 'Service address if the customer offered one' },
+      timing: { type: 'string', description: 'When they prefer, if they said, e.g. "As soon as possible", "Morning"' },
+    },
+    required: ['name', 'phone', 'problem'],
+  },
+};
+
+async function insertChatLead(input, transcript) {
+  const name = String(input.name || '').trim().slice(0, 120);
+  const phone = String(input.phone || '').trim().slice(0, 40);
+  if (name.length < 2) throw new Error('missing customer name');
+  if (phone.replace(/\D/g, '').length < 7) throw new Error('invalid phone number');
+  const id = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO leads (id, name, phone, email, address, problem, details, timing, source, chat)
+     VALUES ($1,$2,$3,NULL,$4,$5,$6,$7,'chat-assistant',$8)`,
+    [
+      id, name, phone,
+      String(input.address || '').trim().slice(0, 300) || null,
+      String(input.problem || 'Service request').trim().slice(0, 100),
+      String(input.details || '').trim().slice(0, 4000) || null,
+      String(input.timing || '').trim().slice(0, 60) || null,
+      transcript.slice(0, 20000) || null,
+    ],
+  );
+  if (NOTIFY_WEBHOOK_URL) {
+    fetch(NOTIFY_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: `New lead (chat): ${name} — ${phone} — ${input.problem || 'service request'}` }),
+    }).catch(() => {});
+  }
+  console.log(`chat lead ${id}: ${name} / ${input.problem || 'n/a'}`);
+  return id;
+}
 
 app.post('/api/chat', async (req, res) => {
   const ip = req.ip || 'unknown';
@@ -216,18 +270,61 @@ app.post('/api/chat', async (req, res) => {
   const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 
   try {
-    const stream = anthropic.messages.stream({
-      model: 'claude-sonnet-5',
-      max_tokens: 700,
-      system: SYSTEM_PROMPT,
-      messages,
-      thinking: { type: 'disabled' },
-      output_config: { effort: 'low' },
-    });
-    stream.on('text', (delta) => send({ t: delta }));
-    const final = await stream.finalMessage();
-    if (final.stop_reason === 'refusal') {
-      send({ t: `I'd rather have a real person help with that one. Give us a call at ${BUSINESS.phone}.` });
+    const transcript = messages
+      .map((m) => (m.role === 'user' ? 'Customer: ' : 'Assistant: ') + m.content)
+      .join('\n');
+
+    let convo = messages;
+    let leadFiled = false;
+
+    // Agentic loop: stream text; if the model files a service request, run the
+    // tool and let it confirm to the customer. Bounded at 3 turns.
+    for (let turn = 0; turn < 3; turn++) {
+      const stream = anthropic.messages.stream({
+        model: 'claude-sonnet-5',
+        max_tokens: 700,
+        system: SYSTEM_PROMPT,
+        messages: convo,
+        tools: [LEAD_TOOL],
+        thinking: { type: 'disabled' },
+        output_config: { effort: 'low' },
+      });
+      stream.on('text', (delta) => send({ t: delta }));
+      const final = await stream.finalMessage();
+
+      if (final.stop_reason === 'refusal') {
+        send({ t: `I'd rather have a real person help with that one. Give us a call at ${BUSINESS.phone}.` });
+        break;
+      }
+
+      if (final.stop_reason !== 'tool_use') break;
+
+      const toolUse = final.content.find((b) => b.type === 'tool_use');
+      if (!toolUse) break;
+
+      let resultText;
+      let justFiled = false;
+      if (leadFiled) {
+        resultText = 'A request was already filed in this conversation. Do not file another unless the customer explicitly asks.';
+      } else if (!pool) {
+        resultText = `ERROR: dispatch is unavailable right now. Ask the customer to call ${BUSINESS.phone}.`;
+      } else {
+        try {
+          const id = await insertChatLead(toolUse.input, transcript);
+          leadFiled = true;
+          justFiled = true;
+          resultText = `Service request filed successfully (reference ${id.slice(0, 8)}). A team member will call the customer back at the number provided.`;
+          send({ leadCreated: true });
+        } catch (err) {
+          resultText = `ERROR: ${err.message}. Ask the customer to re-check that information, or have them call ${BUSINESS.phone}.`;
+        }
+      }
+
+      if (!justFiled && final.content.some((b) => b.type === 'text' && b.text.trim())) send({ t: '\n\n' });
+      convo = convo.concat([
+        { role: 'assistant', content: final.content },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUse.id, content: resultText }] },
+      ]);
     }
     send({ done: true });
   } catch (err) {
